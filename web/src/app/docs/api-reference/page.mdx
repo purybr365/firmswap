@@ -1,0 +1,188 @@
+export const metadata = {
+  title: "API Reference",
+};
+
+# API Reference
+
+The FirmSwap API is a self-hosted quote aggregator built on Fastify. Anyone can run an instance — it is not a centralized service.
+
+## Endpoints
+
+| Method | Path | Description | Rate Limit |
+|--------|------|-------------|------------|
+| GET | `/health` | Health check | — |
+| GET | `/metrics` | Prometheus metrics | Auth optional |
+| POST | `/v1/:chainId/quote` | Request a swap quote | 30/min |
+| GET | `/v1/:chainId/order/:orderId` | Get on-chain order status | 60/min |
+| POST | `/v1/:chainId/solvers/register` | Register a solver | 5/min |
+| DELETE | `/v1/:chainId/solvers/:address` | Unregister a solver | 10/min |
+| GET | `/v1/:chainId/solvers` | List active solvers | 60/min |
+| GET | `/v1/ws` | WebSocket for real-time events | — |
+
+All routes scoped to `:chainId` return `404` if the chain is not supported.
+
+## Quote Request
+
+`POST /v1/:chainId/quote`
+
+```json
+{
+  "inputToken": "0x...",
+  "outputToken": "0x...",
+  "orderType": "EXACT_INPUT",
+  "amount": "1000000000000000000",
+  "userAddress": "0x...",
+  "originChainId": 100,
+  "destinationChainId": 100,
+  "depositMode": "CONTRACT"
+}
+```
+
+### Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `inputToken` | address | Token the user is selling |
+| `outputToken` | address | Token the user is buying |
+| `orderType` | string | `EXACT_INPUT` or `EXACT_OUTPUT` |
+| `amount` | string | Amount in the token's smallest unit |
+| `userAddress` | address | User's wallet address |
+| `originChainId` | number | Chain ID for the deposit |
+| `destinationChainId` | number | Chain ID for the output |
+| `depositMode` | string | `CONTRACT` or `ADDRESS` |
+| `depositWindow` | number | Optional: deposit deadline in seconds (default: 300) |
+
+## Quote Response
+
+```json
+{
+  "quote": {
+    "solver": "0x...",
+    "user": "0x...",
+    "inputToken": "0x...",
+    "inputAmount": "1000000000000000000",
+    "outputToken": "0x...",
+    "outputAmount": "200000000",
+    "orderType": 0,
+    "outputChainId": 100,
+    "depositDeadline": 1700000000,
+    "fillDeadline": 1700000120,
+    "nonce": "123456"
+  },
+  "solverSignature": "0x...",
+  "depositAddress": "0x...",
+  "alternativeQuotes": []
+}
+```
+
+The `quote` fields map directly to the on-chain `FirmSwapQuote` struct. The `solverSignature` is an EIP-712 typed data signature.
+
+## Solver Registration
+
+`POST /v1/:chainId/solvers/register`
+
+```json
+{
+  "address": "0xSolverAddress...",
+  "endpointUrl": "https://solver.example.com",
+  "name": "My Solver",
+  "signature": "0x...",
+  "timestamp": 1700000000000
+}
+```
+
+The `signature` is an EIP-191 personal message signature over:
+
+```
+FirmSwap Solver Registration
+Address: 0xsolveraddress...
+Endpoint: https://solver.example.com
+Timestamp: 1700000000000
+```
+
+Requirements:
+- The solver must be registered on-chain with a bond >= 1,000 USDC
+- The timestamp must be within 5 minutes of the server's clock
+- In production, the endpoint URL must be HTTPS with a public IP (SSRF protection)
+
+## Solver Unregistration
+
+`DELETE /v1/:chainId/solvers/:address`
+
+Requires an EIP-191 signature in the request body proving address ownership.
+
+## WebSocket Events
+
+`GET /v1/ws`
+
+Events are broadcast for all supported chains:
+
+```json
+{ "type": "connected", "supportedChains": [100, 10200] }
+```
+
+```json
+{
+  "type": "Deposited",
+  "chainId": 100,
+  "orderId": "0x...",
+  "user": "0x...",
+  "solver": "0x...",
+  "inputToken": "0x...",
+  "inputAmount": "1000000000000000000",
+  "outputToken": "0x...",
+  "outputAmount": "200000000",
+  "fillDeadline": 1700000120,
+  "blockNumber": 12345
+}
+```
+
+```json
+{ "type": "Settled", "chainId": 100, "orderId": "0x...", "blockNumber": 12346 }
+```
+
+```json
+{
+  "type": "Refunded",
+  "chainId": 100,
+  "orderId": "0x...",
+  "user": "0x...",
+  "inputAmount": "1000000000000000000",
+  "bondSlashed": "10000000",
+  "blockNumber": 12347
+}
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SUPPORTED_CHAINS` | — | Comma-separated chain IDs (e.g., `100,10200,8453`) |
+| `RPC_URL_<chainId>` | — | JSON-RPC endpoint per chain |
+| `FIRMSWAP_ADDRESS_<chainId>` | — | Contract address per chain |
+| `PORT` | 3000 | HTTP server port |
+| `HOST` | 0.0.0.0 | Bind address |
+| `DB_PATH` | ./firmswap-api.db | SQLite path (`:memory:` to disable) |
+| `QUOTE_TIMEOUT_MS` | 2000 | Max wait for solver quotes |
+| `DEFAULT_DEPOSIT_WINDOW` | 300 | Deposit deadline (seconds) |
+| `DEFAULT_FILL_WINDOW` | 120 | Fill window after deposit deadline |
+| `MIN_SOLVER_BOND` | 1000000000 | Minimum bond (1000 USDC, 6 decimals) |
+| `MAX_SOLVERS_PER_CHAIN` | 50 | Max registered solvers per chain |
+| `MAX_QUOTE_FAN_OUT` | 10 | Max solvers queried per quote |
+| `RATE_LIMIT_MAX` | 100 | Requests per window (global) |
+| `RATE_LIMIT_WINDOW_MS` | 60000 | Rate limit window (ms) |
+| `CORS_ORIGINS` | `*` | Allowed origins |
+| `NODE_ENV` | — | `production` enforces HTTPS solver URLs |
+
+## Self-Hosting
+
+```bash
+git clone https://github.com/purybr365/firmswap.git
+cd firmswap/api
+cp .env.example .env
+# Configure SUPPORTED_CHAINS, RPC_URL_*, FIRMSWAP_ADDRESS_*
+npm install
+npm start
+```
+
+Multiple API instances can coexist, each with their own solver set. The smart contract is the source of truth — the API never holds funds.

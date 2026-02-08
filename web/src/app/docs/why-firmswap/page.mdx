@@ -1,0 +1,84 @@
+# Why FirmSwap
+
+FirmSwap was born from a real-world need — not an abstract research paper. It solves a concrete problem that existing DeFi protocols couldn't address: **guaranteed-price swaps with flexible deadlines**, built for applications where users don't execute trades instantly.
+
+## The Problem
+
+[Picnic](https://picnic.money) is a fully on-chain crypto neobank focused on Brazilian users. Picnic has always done its foreign exchange on-chain, trading **BRLA** (a Brazilian Real stablecoin) to and from **USDC**. This allows users to go from fiat to any token on-chain in seconds via DeFi.
+
+To make this seamless, Picnic needed a **pix-to-token** flow:
+
+1. The user sees a quoted exchange rate (e.g. 1,000 BRL → 180 USDC)
+2. The user signs a swap transaction
+3. The user goes to their bank and pays via **PIX** (Brazil's instant payment system)
+4. The PIX payment is received and converted into on-chain BRLA
+5. The BRLA is swapped for USDC (or any other token)
+
+The problem is that steps 3–4 take time. The user leaves the app, opens their banking app, authorizes the PIX transfer, and then the payment needs to be processed and minted as on-chain BRLA. This could take seconds or minutes.
+
+During that delay, two things go wrong:
+
+- **Extra transaction**: The user had to sign an approval or swap transaction *before* paying PIX. That's an additional on-chain interaction — bad for UX, especially for non-crypto-native users.
+- **Price slippage**: By the time the BRLA arrives on-chain and the swap executes, the market has moved. The user was shown one price but received another. Every single time.
+
+## The TradFi Standard
+
+This isn't how traditional finance works. When you use **Wise** (formerly TransferWise) to send money internationally, you see a quoted exchange rate and that rate is **guaranteed** — often for hours, sometimes even days. You know exactly how much you'll receive before you send a single dollar.
+
+The same applies to most FX services, remittance platforms, and even credit card processors. The quoted price is the executed price. Period.
+
+In DeFi, there was no equivalent. AMM prices change every block. Dutch auctions decay continuously. Batch auctions settle at clearing prices that differ from the quote. Every existing mechanism accepted price uncertainty as a given.
+
+For Picnic's use case — where the user pays *after* seeing a quote, and token delivery happens minutes later — none of these solutions worked.
+
+## The FirmSwap Solution
+
+FirmSwap solves this with a simple mechanism:
+
+**Every quote is locked to an exact price and an on-chain deadline.**
+
+When a solver provides a quote, they commit to delivering *exactly* the quoted output amount. The quote includes two deadlines:
+
+- **Deposit deadline**: The user must deposit input tokens by this time
+- **Fill deadline**: The solver must deliver output tokens by this time
+
+Both deadlines are `uint32` Unix timestamps stored on-chain. They're fully flexible — a solver can offer a 30-second window or a 24-hour window, depending on the use case.
+
+### Accountability Through Bonds
+
+What makes this credible isn't a promise — it's capital. Every solver stakes USDC in the FirmSwap contract. 5% of their bond is reserved per active order. If the solver misses the fill deadline:
+
+- The user calls `refund()` and receives their tokens back
+- Plus **5% of the solver's bond** as compensation
+- A 7-day unstake delay prevents solvers from pulling their bond after accepting orders
+
+### Zero-Transaction Deposits
+
+FirmSwap supports **address-mode deposits** using CREATE2 deterministic addresses. The user simply transfers tokens to a pre-computed address — no approval transaction, no contract interaction. This is critical for flows like Picnic's, where the token transfer happens automatically after PIX settlement.
+
+### The Result
+
+For Picnic, FirmSwap means:
+
+1. User sees a guaranteed price (e.g. 1,000 BRL → 180.00 USDC)
+2. User pays via PIX — no wallet interaction needed
+3. PIX settles, BRLA is minted and sent to the deposit address
+4. Solver delivers exactly 180.00 USDC before the deadline
+5. If the solver fails — automatic refund plus compensation
+
+No slippage. No extra transactions. No trust assumptions. The quoted price is the executed price.
+
+## Beyond Picnic
+
+While FirmSwap was born from Picnic's needs, it's a **permissionless protocol**. Any application can integrate it. Any solver can participate. The contract is immutable — no governance, no admin keys, no proxy upgrades.
+
+Use cases extend far beyond Brazilian FX:
+
+- **Cross-border remittance** platforms that need price guarantees
+- **Payroll services** converting stablecoins at locked rates
+- **OTC desks** looking for on-chain settlement with accountability
+- **Any application** where the user sees a price and expects to receive exactly that amount
+
+FirmSwap is ~630 lines of Solidity. No token. No DAO. No oracle. Just guaranteed prices with deadline enforcement and solver accountability.
+
+**That's crypto solving real-world problems.**

@@ -1,0 +1,322 @@
+import { Callout } from "@/components/docs/Callout";
+import { Mermaid } from "@/components/docs/Mermaid";
+
+# Deposit Addresses (CREATE2)
+
+FirmSwap's address-mode deposits allow users to fund a swap by simply transferring tokens to a deterministic address — no approval transaction, no contract interaction, no wallet signature required. This is made possible by Ethereum's `CREATE2` opcode, which computes contract addresses before deployment.
+
+This page is a deep dive into how deposit addresses work, who controls them, and what happens in every edge case.
+
+## How CREATE2 Works
+
+In Ethereum, `CREATE2` deploys a contract at a **deterministic address** computed from four inputs:
+
+```
+address = keccak256(0xff ++ deployer ++ salt ++ keccak256(initCode))[12:]
+```
+
+| Input | Value in FirmSwap |
+|-------|-------------------|
+| `deployer` | The FirmSwap contract address |
+| `salt` | The order ID (derived from quote + solver signature) |
+| `initCode` | DepositProxy creation bytecode with FirmSwap address encoded |
+
+The key insight: **this address exists before any contract is deployed there.** ERC-20 tokens can be transferred to the address even though no contract lives at it yet. When the `DepositProxy` is later deployed at that exact address via `CREATE2`, it can access those tokens.
+
+<Callout type="info">
+**No private key controls a deposit address.** It is purely deterministic — derived from the deployer address, a unique salt, and the contract bytecode. There is no owner, no admin, and no way to move tokens from the address without deploying the DepositProxy contract.
+</Callout>
+
+## Each Quote Gets a Unique Address
+
+The salt used for `CREATE2` is the **order ID**, computed as:
+
+```solidity
+orderId = keccak256(abi.encode(QuoteLib.hash(quote), keccak256(solverSignature)))
+```
+
+Since every quote has a unique nonce per solver, and the solver's EIP-712 signature is unique per quote, every quote produces a unique order ID and therefore a unique deposit address.
+
+You can compute the deposit address in two ways:
+
+- **On-chain**: Call `firmSwap.computeDepositAddress(quote, solverSignature)` (view function, no gas cost when called off-chain)
+- **Off-chain (SDK)**: Use `client.getDepositAddress(quoteResponse)` which applies the same `CREATE2` formula locally
+
+## The DepositProxy Contract
+
+The `DepositProxy` is an intentionally minimal contract (~31 lines, ~100 bytes of runtime bytecode):
+
+```solidity
+contract DepositProxy {
+    address public immutable FIRM_SWAP;
+
+    constructor(address _firmSwap) {
+        FIRM_SWAP = _firmSwap;
+    }
+
+    function sweep(address token, address to) external {
+        require(msg.sender == FIRM_SWAP, "DepositProxy: only FirmSwap");
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        if (bal > 0) {
+            IERC20(token).safeTransfer(to, bal);
+        }
+    }
+}
+```
+
+Key properties:
+
+| Property | Value |
+|----------|-------|
+| **Owner** | None — no admin, no governance |
+| **Who can call `sweep()`** | Only the FirmSwap contract |
+| **What it sweeps** | Any ERC-20 token, entire balance |
+| **Self-destruct?** | No — the contract remains deployed |
+| **Runtime bytecode** | ~100 bytes |
+
+## Settlement Flow
+
+When a solver settles an address-mode deposit, everything happens atomically in a single transaction:
+
+<Mermaid chart={`
+sequenceDiagram
+    participant User
+    participant DA as Deposit Address
+    participant Solver
+    participant FS as FirmSwap
+    participant Proxy as DepositProxy
+
+    User->>DA: 1. Transfer inputToken
+    Note over DA: Tokens sit at address<br/>(no contract yet)
+    Solver->>FS: 2. settle(quote, sig)
+    FS->>FS: 3. Validate quote + sig (EIP-712)
+    FS->>DA: 4. Check balance >= inputAmount
+    FS->>FS: 5. Consume nonce, check bond
+    FS->>FS: 6. Store order as SETTLED
+    FS->>Proxy: 7. CREATE2 deploy DepositProxy
+    FS->>Proxy: 8. sweep(inputToken, FirmSwap)
+    Proxy-->>FS: All tokens transferred
+    Solver-->>FS: 9. outputToken (transferFrom)
+    FS-->>User: 10. outputToken delivered
+    FS-->>Solver: 11. inputAmount forwarded
+    Note over FS: Excess stored for user
+`} />
+
+Steps 2–11 all happen in **one transaction**. If any step fails, the entire transaction reverts and no state changes occur. This is the atomic settlement guarantee.
+
+**Excess protection**: Only `quote.inputAmount` is sent to the solver. If more tokens were deposited, the excess is stored in the contract and can be withdrawn by the user via `withdrawExcess()`.
+
+**Who calls `settle()`?** Typically the solver, because step 9 requires `transferFrom` of the solver's output tokens. However, technically anyone can call it as long as the solver has approved FirmSwap for the output token.
+
+## Settlement with Tolerance
+
+Sometimes rounding differences cause the deposited amount to be slightly less than `quote.inputAmount` (e.g., 123.450000 vs 123.456000). Standard `settle()` would revert with `InsufficientDeposit`.
+
+FirmSwap provides `settleWithTolerance()` for this scenario:
+
+```solidity
+function settleWithTolerance(
+    QuoteLib.FirmSwapQuote calldata quote,
+    bytes calldata solverSignature,
+    uint256 acceptedInputAmount  // solver accepts this instead of quote.inputAmount
+) external;
+```
+
+**Key properties:**
+- The **solver** controls the tolerance — they accept fewer input tokens
+- The **user** still receives the full quoted `outputAmount` — the firm price guarantee is preserved
+- `acceptedInputAmount` must be &lt;= `quote.inputAmount` (solver can't demand more)
+- Any amount above `acceptedInputAmount` is stored as excess for the user
+
+This handles rounding elegantly without making the protocol less safe.
+
+## Refund Flow
+
+If the solver fails to settle before the `fillDeadline`, anyone can trigger a refund:
+
+<Mermaid chart={`
+sequenceDiagram
+    participant User
+    participant DA as Deposit Address
+    participant Anyone
+    participant FS as FirmSwap
+    participant Proxy as DepositProxy
+
+    User->>DA: 1. Transfer inputToken
+    Note over DA: Solver misses fillDeadline
+    Note over FS: block.timestamp > fillDeadline
+    Anyone->>FS: 2. refundAddressDeposit(quote, sig)
+    FS->>FS: 3. Validate quote (no deadline check)
+    FS->>FS: 4. Verify past fillDeadline
+    FS->>DA: 5. Check balance > 0
+    FS->>FS: 6. Consume nonce
+    FS->>FS: 7. Slash bond (if full deposit)
+    FS->>FS: 8. Store order as REFUNDED
+    FS->>Proxy: 9. CREATE2 deploy DepositProxy
+    FS->>Proxy: 10. sweep(inputToken, FirmSwap)
+    FS-->>User: 11. inputToken returned
+    FS-->>User: 12. Slashed bond (USDC)
+`} />
+
+<Callout type="warning">
+**Bond slashing only occurs for full deposits.** If the deposit amount is less than the quoted `inputAmount`, the solver's bond is NOT slashed. This prevents griefing attacks where someone deposits 1 wei to trigger a bond slash.
+</Callout>
+
+## Recovery
+
+FirmSwap provides two recovery mechanisms for tokens stuck at deposit addresses:
+
+### `recoverFromProxy()` — When Proxy Already Exists
+
+After `settle()` or `refundAddressDeposit()` deploys the DepositProxy, the contract remains at the deposit address. If additional tokens are sent there afterwards — or if the wrong token was sent before settlement — those tokens would be stuck without recovery.
+
+```solidity
+function recoverFromProxy(
+    QuoteLib.FirmSwapQuote calldata quote,
+    bytes calldata solverSignature,
+    address token    // can be ANY ERC-20, not just quote.inputToken
+) external;
+```
+
+- **Callable by anyone** — permissionless recovery
+- **Funds always go to `quote.user`** — the original user of the order
+- **Works for any ERC-20** — not limited to the quoted input token
+- **No bond changes** — pure recovery, no penalties
+- **Requires order to exist** — the proxy must have been deployed (order in SETTLED or REFUNDED state)
+
+### `deployAndRecover()` — When Only Wrong Token Sent
+
+If **only** a wrong token was sent to a deposit address and the correct `inputToken` was never deposited, neither `settle()` nor `refundAddressDeposit()` would succeed (one requires sufficient deposit, the other needs any deposit). The proxy is never deployed, and `recoverFromProxy()` can't work.
+
+`deployAndRecover()` solves this:
+
+```solidity
+function deployAndRecover(
+    QuoteLib.FirmSwapQuote calldata quote,
+    bytes calldata solverSignature,
+    address token    // the wrong token to recover
+) external;
+```
+
+- **Callable by anyone** — permissionless, after `fillDeadline`
+- **Terminal** — consumes the nonce and stores the order as REFUNDED
+- **No bond slash** — the solver did nothing wrong (user sent wrong token)
+- **Enables `recoverFromProxy()`** — after deployment, additional stuck tokens can be recovered
+- **After calling this, `settle()` cannot be called** — the nonce is consumed
+
+### Excess Withdrawal
+
+When more tokens than `quote.inputAmount` are deposited and `settle()` is called, only `inputAmount` goes to the solver. The excess is stored in the contract:
+
+```solidity
+function withdrawExcess(address token) external;
+```
+
+- **Only callable by the user** who has excess stored
+- **Any ERC-20 token** — not limited to one specific token
+- **No time restriction** — can be withdrawn anytime
+
+## Who Can Call What
+
+| Function | Who | When | Result |
+|----------|-----|------|--------|
+| `computeDepositAddress()` | Anyone | Any time (view) | Returns deposit address |
+| `settle()` | Anyone (typically solver) | Before `depositDeadline`, deposit >= `inputAmount` | Order SETTLED |
+| `settleWithTolerance()` | Anyone (typically solver) | Before `depositDeadline`, deposit >= `acceptedInputAmount` | Order SETTLED |
+| `refundAddressDeposit()` | Anyone | After `fillDeadline`, deposit > 0 | Order REFUNDED |
+| `recoverFromProxy()` | Anyone | After order exists (SETTLED/REFUNDED) | Tokens to user |
+| `deployAndRecover()` | Anyone | After `fillDeadline`, order NONE | Order REFUNDED, tokens to user |
+| `withdrawExcess()` | User with excess | Any time | Excess tokens to user |
+
+## Edge Cases
+
+### 1. Funds Sent After Settlement
+
+**Scenario**: Tokens are accidentally sent to a deposit address after `settle()` has already deployed the proxy and swept the original deposit.
+
+**Outcome**: The tokens sit in the deployed DepositProxy contract. Call `recoverFromProxy(quote, sig, token)` to sweep them back to the user.
+
+### 2. Wrong Token Sent (Before Settlement)
+
+**Scenario**: A different ERC-20 token (not `quote.inputToken`) is sent to the deposit address before settlement.
+
+**Outcome**: If the correct inputToken is also deposited, `settle()` works normally and sweeps only the inputToken. After settlement, call `recoverFromProxy(quote, sig, wrongTokenAddress)` to recover the wrong token.
+
+### 3. Wrong Token Only (No InputToken Ever Sent)
+
+**Scenario**: Only a wrong token is sent to the deposit address. The correct `inputToken` is never deposited.
+
+**Outcome**: After `fillDeadline`, call `deployAndRecover(quote, sig, wrongTokenAddress)`. This deploys the proxy, recovers the wrong token to the user, and marks the order as REFUNDED. No bond is slashed.
+
+### 4. User Deposits Less Than Quoted
+
+**Scenario**: The user deposits fewer tokens than `quote.inputAmount`.
+
+**Outcome**:
+- `settle()` **reverts** with `InsufficientDeposit` — the solver cannot settle
+- Solver can use `settleWithTolerance()` if the shortfall is acceptable (solver absorbs the loss)
+- After `fillDeadline`, `refundAddressDeposit()` returns the partial deposit to the user
+- **Solver's bond is NOT slashed** — partial deposits don't penalize the solver
+- No bond compensation is paid to the user
+
+### 5. User Deposits More Than Quoted
+
+**Scenario**: More tokens than `quote.inputAmount` are sent to the deposit address.
+
+**Outcome**: `settle()` sends only `inputAmount` to the solver. The excess is stored in the FirmSwap contract under the user's `excessBalances`. The user can withdraw it at any time by calling `withdrawExcess(token)`.
+
+<Callout type="info">
+To avoid depositing excess tokens, integrators should transfer exactly `quote.inputAmount` to the deposit address. The SDK and API both return the precise amount required.
+</Callout>
+
+### 6. Full Deposit, Solver Doesn't Fill
+
+**Scenario**: The user deposits the full `inputAmount`, but the solver fails to call `settle()` before `fillDeadline`.
+
+**Outcome**: Anyone calls `refundAddressDeposit()` after the deadline. The user receives:
+1. Their full deposit back
+2. 5% of the solver's bond (in USDC) as compensation
+
+The solver is penalized for failing to honor their signed quote.
+
+### 7. Deposit After Deadline
+
+**Scenario**: The user deposits tokens after the `depositDeadline` has passed.
+
+**Outcome**: `settle()` reverts with `QuoteExpired`. The tokens sit at the deposit address until `fillDeadline` passes, then `refundAddressDeposit()` can be called. Since the solver never had a chance to settle (deadline already passed), the solver's bond is NOT slashed if the deposit was also less than `inputAmount`.
+
+### 8. Native ETH Sent to Deposit Address
+
+**Scenario**: Someone sends native ETH (not wrapped) to the deposit address.
+
+**Outcome**: Before proxy deployment, the address has no code — ETH transfers succeed but the ETH is **trapped**. The DepositProxy has no `receive()` or `fallback()` function, so it cannot sweep native ETH. FirmSwap only supports ERC-20 tokens.
+
+<Callout type="warning">
+**FirmSwap is ERC-20 only.** Native ETH sent to a deposit address cannot be recovered. Always use wrapped ETH (WETH) or other ERC-20 tokens.
+</Callout>
+
+### 9. NFTs (ERC-721/ERC-1155) Sent to Deposit Address
+
+**Scenario**: Someone sends an NFT to the deposit address.
+
+**Outcome**: NFTs are not recoverable. The DepositProxy's `sweep()` function only handles ERC-20 tokens via `IERC20.balanceOf()` and `safeTransfer()`. ERC-721 and ERC-1155 tokens require different interfaces and are not supported.
+
+### 10. Fee-on-Transfer Tokens
+
+**Scenario**: The input token charges a fee on transfer (e.g., deflationary tokens).
+
+**Outcome**: FirmSwap uses a `balanceOf` before/after pattern (`actualReceived`) to handle this safely. The solver receives `actualReceived` (less than `inputAmount` due to the fee). The excess calculation is based on `actualReceived`, not the raw deposit amount. Solvers should be aware that fee-on-transfer tokens will result in receiving less than `inputAmount`.
+
+## Design Decisions
+
+FirmSwap's deposit address system was designed with specific trade-offs compared to alternative approaches:
+
+| Design Choice | FirmSwap | Alternative (e.g., Relay) | Rationale |
+|--------------|----------|--------------------------|-----------|
+| **Price on surplus** | Firm — user gets quoted output, excess stored for user | Re-quote with more output | Predictability for users; firm price guarantee preserved |
+| **Price on shortage** | Firm — solver absorbs loss via `settleWithTolerance()` | Re-quote with less output | User always gets quoted output or nothing |
+| **Refund mechanism** | Permissionless, on-chain, anyone can trigger | Centralized, automatic detection | No single point of failure; trustless |
+| **Deposit addresses** | Unique per quote (nonce-based) | Reusable for same route | Prevents confusion; each order is independent |
+| **Refund recipient** | Always `quote.user` | Configurable `refundTo` | Simpler, prevents fund misdirection |
+| **Wrong token recovery** | Fully supported (ERC-20) | Not supported | Users should never lose ERC-20 tokens |
+| **Accountability** | On-chain bond with slashing | Off-chain reputation | Trustless, verifiable, immediate |

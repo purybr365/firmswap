@@ -1,0 +1,151 @@
+export const metadata = {
+  title: "Solver Guide",
+};
+
+# Solver Guide
+
+This guide covers how to run a FirmSwap solver, understand the economics, and integrate your own price sources.
+
+## Architecture
+
+<Mermaid chart={`
+graph TD
+  subgraph Solver
+    CEX[CEX Adapter] --> Quoter
+    Quoter --> Signer[Signer\nEIP-712]
+    Signer --> Nonce[Nonce Manager]
+    Nonce --> Filler[Filler\non-chain]
+    Monitor[Monitor\nevents] --> Filler
+    HTTP[HTTP Server — Fastify]
+  end
+  style Solver fill:#111118,stroke:#2a2a3a,color:#f0f0f5
+  style Quoter fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style Signer fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style Nonce fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style Filler fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style Monitor fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style CEX fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style HTTP fill:#16161f,stroke:#818cf8,color:#f0f0f5
+`} />
+
+## Components
+
+- **Quoter** — Calculates output amounts using CEX mid-price + configurable spread
+- **Signer** — Signs quotes using EIP-712 typed data (matching the FirmSwap contract domain)
+- **NonceManager** — Generates unique nonces for each quote (prevents replay)
+- **Monitor** — Polls for on-chain `Deposited` events
+- **Filler** — Automatically fills deposited orders by calling `fill()` on-chain. Uses a sequential queue to prevent concurrent transaction submissions
+- **HTTP Server** — Exposes `/quote` endpoint for the API aggregator
+
+## Quick Start
+
+```bash
+git clone https://github.com/purybr365/firmswap.git
+cd firmswap/solver
+
+cp .env.example .env
+# Edit .env: set SOLVER_PRIVATE_KEY (required)
+
+npm install
+npm run dev    # Development with auto-reload
+npm start      # Production
+```
+
+## Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SOLVER_PRIVATE_KEY` | — | Private key for signing quotes and filling orders |
+| `CHAIN_ID` | 100 | Chain ID |
+| `RPC_URL` | `https://rpc.gnosis.gateway.fm` | JSON-RPC endpoint |
+| `FIRMSWAP_ADDRESS` | — | FirmSwap contract address |
+| `PORT` | 3001 | HTTP server port |
+| `API_URL` | `http://localhost:3000` | API URL for self-registration |
+| `SOLVER_NAME` | `"My FirmSwap Solver"` | Display name |
+| `SPREAD_BPS` | 50 | Spread over mid-price (basis points, 50 = 0.5%) |
+| `MAX_ORDER_SIZE_USD` | 50000 | Maximum order size |
+| `POLL_INTERVAL_MS` | 3000 | Event polling interval |
+| `AUTO_FILL` | true | Auto-fill deposited orders |
+| `BINANCE_API_KEY` | — | Optional Binance API key |
+| `BINANCE_API_SECRET` | — | Optional Binance API secret |
+
+## CEX Adapter System
+
+The solver uses a pluggable price source interface (`ICexAdapter`):
+
+### Built-in Adapters
+
+- **BinanceAdapter** — Connects to the Binance API for real-time prices. Set `BINANCE_API_KEY` and `BINANCE_API_SECRET` to use.
+- **MockCexAdapter** — Returns configurable mock prices. Used by default for testing and development.
+
+### Building Your Own Adapter
+
+Implement the `ICexAdapter` interface:
+
+```typescript
+interface ICexAdapter {
+  getPrice(base: string, quote: string): Promise<number>;
+  getName(): string;
+}
+```
+
+Then plug it into the Quoter during solver initialization.
+
+## Economics
+
+### Revenue
+
+Solvers earn the **spread** between the price they quote to users and the price they can execute at. The reference solver uses a configurable `SPREAD_BPS` (default 50 = 0.5%).
+
+Example: If the CEX mid-price for BRLA/USDC is 0.18, the solver quotes 0.1791 (0.5% less for EXACT_INPUT). The 0.0009 difference per unit is the solver's profit.
+
+### Costs
+
+- **Bond capital**: 1,000+ USDC locked on-chain (required to register)
+- **Gas fees**: Approximately 100-150k gas per `fill()` transaction
+- **Opportunity cost**: 5% of each order's output value is reserved from the bond while the order is active
+
+### Risk
+
+- **Default penalty**: If the solver fails to fill within the deadline, 5% of the output amount is slashed from the bond
+- **Inventory risk**: The solver must hold sufficient balances of tokens it's willing to quote
+- **Price risk**: Between quoting and filling, the market price may move against the solver
+
+## Deadlines
+
+Every quote the solver signs includes two deadlines set by the API:
+
+- **`depositDeadline`**: Unix timestamp by which the user must deposit. The API sets this to `now + depositWindow` (default 300 seconds / 5 minutes). The user can request a shorter window.
+- **`fillDeadline`**: Unix timestamp by which the solver must call `fill()`. The API sets this to `depositDeadline + fillWindow` (default 120 seconds / 2 minutes).
+
+Both deadlines are part of the EIP-712 signed struct — the solver cryptographically commits to them. The contract enforces:
+- Deposits are rejected after `depositDeadline`
+- `fill()` is rejected after `fillDeadline`
+- `refund()` is only available after `fillDeadline`
+
+### Why Deadlines Protect Solvers
+
+Deadlines limit the solver's exposure window. A solver is only at risk of being required to fill for the duration between deposit and fill deadline. After the fill deadline:
+- If the user never deposited: the quote simply expires (no cost to the solver)
+- If the user deposited but the solver did not fill: the user can refund and the solver's bond is slashed
+- The solver cannot be forced to fill an arbitrarily old quote
+
+There are no hardcoded MIN/MAX deadline values in the contract — the API operator controls the defaults, and users can request custom deposit windows.
+
+## Registration Flow
+
+The solver automatically self-registers with the API on startup:
+
+1. Solver signs an EIP-191 message proving ownership of its address
+2. Solver calls `POST /v1/:chainId/solvers/register` with the signed message
+3. API verifies the signature and checks on-chain bond status
+4. If bond >= 1,000 USDC, the solver is registered and starts receiving quote requests
+
+## Monitoring and Filling
+
+1. The Monitor polls the FirmSwap contract for `Deposited` events
+2. When a deposit matching the solver's address is detected, it enters the fill queue
+3. The Filler calls `fill()` on-chain, delivering output tokens to the user
+4. On success, the bond reservation is released
+
+The fill queue is sequential — only one transaction at a time to prevent nonce conflicts.

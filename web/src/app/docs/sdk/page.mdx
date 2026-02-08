@@ -1,0 +1,191 @@
+export const metadata = {
+  title: "SDK Reference",
+};
+
+# SDK Reference
+
+TypeScript SDK for the FirmSwap Protocol, built on [viem](https://viem.sh). Provides a high-level client for requesting quotes, depositing tokens, and monitoring orders.
+
+## Installation
+
+```bash
+npm install @firmswap/sdk viem
+```
+
+## FirmSwapClient
+
+The main SDK entry point. Handles API communication, quote fetching, deposit construction, and safety checks.
+
+```typescript
+import { FirmSwapClient, DepositMode } from "@firmswap/sdk";
+
+const client = new FirmSwapClient({
+  apiUrl: "http://localhost:3000",
+  chainId: 100,
+  rpcUrl: "https://rpc.gnosis.gateway.fm",      // Optional: for on-chain reads
+  firmSwapAddress: "0x...",                       // Optional: for on-chain reads
+});
+```
+
+### Configuration
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `apiUrl` | string | Yes | API aggregator URL |
+| `chainId` | number | Yes | Chain ID |
+| `rpcUrl` | string | No | JSON-RPC URL for on-chain reads |
+| `firmSwapAddress` | address | No | FirmSwap contract address |
+| `timeoutMs` | number | No | Request timeout (default: 10000) |
+
+## Methods
+
+### getQuote
+
+Request a swap quote from the aggregator.
+
+```typescript
+const quoteResponse = await client.getQuote({
+  inputToken: "0x...",
+  outputToken: "0x...",
+  orderType: "EXACT_INPUT",
+  amount: "1000000000000000000",
+  userAddress: "0x...",
+  originChainId: 100,
+  destinationChainId: 100,
+  depositMode: "CONTRACT",
+});
+```
+
+Returns a `QuoteResponse` with the best quote, solver signature, deposit address, and alternative quotes.
+
+### deposit
+
+Approve and deposit tokens in a single call. Includes a safety check that `quote.user` matches the connected wallet.
+
+```typescript
+const txHash = await client.deposit(walletClient, quoteResponse);
+```
+
+### buildDepositCalls
+
+Build encoded calls (approve + deposit) without executing them. Useful for ERC-4337 smart accounts that support batching.
+
+```typescript
+const calls = await client.buildDepositCalls(quoteResponse, userAddress);
+await smartAccount.executeBatch(calls);
+```
+
+### getDepositAddress
+
+Get the deterministic CREATE2 deposit address for an Address Deposit quote. Includes an on-chain verification check when RPC is available.
+
+```typescript
+const depositAddr = await client.getDepositAddress(quoteResponse);
+```
+
+### getOrderStatus
+
+Read order status directly from the contract (requires `rpcUrl` and `firmSwapAddress`).
+
+```typescript
+const status = await client.getOrderStatus("0xOrderId...");
+```
+
+### getOrderStatusViaApi
+
+Read order status from the API (no RPC needed).
+
+```typescript
+const status = await client.getOrderStatusViaApi("0xOrderId...");
+```
+
+## Permit2 Support
+
+```typescript
+import { depositWithPermit2, ensurePermit2Approval } from "@firmswap/sdk";
+
+// One-time approval of Permit2 for a token
+await ensurePermit2Approval(walletClient, publicClient, tokenAddress);
+
+// Deposit using Permit2
+const txHash = await depositWithPermit2({
+  walletClient,
+  publicClient,
+  firmSwapAddress: "0x...",
+  quote: deserializeQuote(quoteResponse.quote),
+  solverSignature: quoteResponse.solverSignature,
+});
+```
+
+## Safety Checks
+
+The SDK includes built-in protections:
+
+- **`deposit()`** verifies that `quote.user` matches the connected wallet before submitting any transaction
+- **`getDepositAddress()`** verifies the API-provided address against on-chain `computeDepositAddress()` when RPC is available
+- **HTTPS warning** when using an HTTP API URL
+
+## Deadlines
+
+Every quote returned by the API includes two deadline fields:
+
+- **`depositDeadline`** — Unix timestamp. The user must deposit before this time, or the quote expires.
+- **`fillDeadline`** — Unix timestamp. The solver must fill before this time, or the user can call `refund()`.
+
+### Setting a Custom Deposit Window
+
+Pass `depositWindow` (in seconds) to `getQuote()` to override the default 5-minute deposit deadline:
+
+```typescript
+const quoteResponse = await client.getQuote({
+  // ...other params
+  depositWindow: 120, // 2-minute deposit deadline
+});
+
+// The returned quote will have:
+// depositDeadline = now + 120 seconds
+// fillDeadline    = depositDeadline + fill window (default 120s)
+```
+
+### Checking Deadlines
+
+```typescript
+import { deserializeQuote } from "@firmswap/sdk";
+
+const quote = deserializeQuote(quoteResponse.quote);
+console.log("Deposit by:", new Date(quote.depositDeadline * 1000));
+console.log("Fill by:", new Date(quote.fillDeadline * 1000));
+```
+
+The SDK does not automatically check whether a deadline has passed before depositing — integrators should verify `Date.now() / 1000 < quote.depositDeadline` before proceeding.
+
+## Exported API
+
+| Export | Type | Description |
+|--------|------|-------------|
+| `FirmSwapClient` | Class | High-level SDK client |
+| `FirmSwapContract` | Class | Low-level contract reader |
+| `FirmSwapError` | Class | Typed error with status code |
+| `createFirmSwapPublicClient` | Function | Create viem PublicClient |
+| `deserializeQuote` | Function | JSON quote to on-chain format |
+| `serializeQuote` | Function | On-chain quote to JSON format |
+| `depositWithPermit2` | Function | Deposit with Permit2 |
+| `ensurePermit2Approval` | Function | Approve Permit2 for a token |
+| `PERMIT2_ADDRESS` | Constant | Canonical Permit2 address |
+| `firmSwapAbi` | Constant | FirmSwap contract ABI |
+| `erc20Abi` | Constant | ERC-20 ABI |
+| `OrderType` | Enum | EXACT_INPUT, EXACT_OUTPUT |
+| `OrderState` | Enum | NONE, DEPOSITED, SETTLED, REFUNDED |
+| `DepositMode` | Enum | CONTRACT, ADDRESS |
+
+## Types
+
+| Type | Description |
+|------|-------------|
+| `FirmSwapConfig` | SDK configuration |
+| `FirmSwapQuote` | On-chain quote struct (bigint amounts) |
+| `SerializedQuote` | JSON-serializable quote (string amounts) |
+| `QuoteRequest` | API quote request |
+| `QuoteResponse` | API quote response |
+| `AlternativeQuote` | Non-winning solver quote |
+| `OrderStatus` | On-chain order state |

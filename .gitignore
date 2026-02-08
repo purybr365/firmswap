@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+
+# Foundry build artifacts
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# TypeScript build output
+dist/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Claude Code project memory
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# SQLite databases
+*.db
+*.db-wal
+*.db-shm
+
+# Test coverage
+coverage/
+lcov.info
+
+# Test UI (local testing only)
+test-ui/
+
+# Next.js (web)
+web/.next/
+web/out/

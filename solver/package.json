@@ -1,0 +1,37 @@
+{
+  "name": "@firmswap/solver",
+  "version": "0.1.0",
+  "description": "FirmSwap Reference Solver",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/purybr365/firmswap.git",
+    "directory": "solver"
+  },
+  "homepage": "https://github.com/purybr365/firmswap#readme",
+  "bugs": "https://github.com/purybr365/firmswap/issues",
+  "keywords": ["firmswap", "defi", "swap", "solver", "market-maker", "gnosis"],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "fastify": "^5.7.4",
+    "viem": "^2.45.1",
+    "dotenv": "^17.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.1",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

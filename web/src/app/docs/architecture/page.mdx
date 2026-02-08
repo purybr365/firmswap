@@ -1,0 +1,186 @@
+export const metadata = {
+  title: "Architecture",
+};
+
+# Architecture
+
+Deep dive into FirmSwap's system design, security model, and decentralization properties.
+
+## System Topology
+
+<Mermaid chart={`
+graph TD
+  User([User]) --> SDK([SDK])
+  SDK --> API[API Aggregator]
+  API --> S1[Solver 1]
+  API --> S2[Solver 2]
+  API --> SN[Solver N]
+  API --> Contract[FirmSwap Contract]
+  Contract --> AD[Address Deposit\nCREATE2]
+  Contract --> CD[Contract Deposit\ndeposit + fill]
+  style User fill:#6366f1,stroke:#818cf8,color:#fff
+  style Contract fill:#16161f,stroke:#6366f1,color:#f0f0f5
+  style AD fill:#16161f,stroke:#2a2a3a,color:#a0a0b5
+  style CD fill:#16161f,stroke:#2a2a3a,color:#a0a0b5
+`} />
+
+The API is a convenience layer — users can bypass it entirely by obtaining a solver's signed quote out-of-band and interacting with the contract directly.
+
+## Multi-Chain Design
+
+A single API instance serves multiple chains via URL-scoped routes:
+
+```
+POST /v1/100/quote     → Gnosis Chain
+POST /v1/10200/quote   → Gnosis Chiado
+POST /v1/8453/quote    → Base
+```
+
+Each chain has:
+- Its own FirmSwap contract deployment (same bytecode, different address)
+- Its own solver registry (solvers register per chain)
+- Its own event poller and WebSocket events
+- A shared SQLite database with a `chain_id` column
+
+Configuration is per-chain via environment variables:
+```
+SUPPORTED_CHAINS=100,10200,8453
+RPC_URL_100=https://rpc.gnosis.gateway.fm
+RPC_URL_10200=https://rpc.chiadochain.net
+FIRMSWAP_ADDRESS_100=0x...
+FIRMSWAP_ADDRESS_10200=0xE08Ee2901bbfD8A7837D294D3e43338871e075a4
+```
+
+## Quote Aggregation Flow
+
+1. User sends a `QuoteRequest` to the API
+2. API selects up to `maxQuoteFanOut` (default: 10) active solvers
+3. API sends the request to all selected solvers in parallel with a 2-second timeout
+4. Each solver responds with a signed `FirmSwapQuote` + EIP-712 signature
+5. API verifies each signature against the solver's address
+6. Quotes are ranked by best price:
+   - `EXACT_INPUT`: highest `outputAmount` wins
+   - `EXACT_OUTPUT`: lowest `inputAmount` wins
+7. Best quote + alternatives returned to the user
+
+## EIP-712 Signing
+
+All quotes are signed using EIP-712 typed data:
+
+```
+Domain:
+  name: "FirmSwap"
+  version: "1"
+  chainId: <chain ID>
+  verifyingContract: <FirmSwap address>
+
+Type: FirmSwapQuote
+  solver: address
+  user: address
+  inputToken: address
+  inputAmount: uint256
+  outputToken: address
+  outputAmount: uint256
+  orderType: uint8
+  outputChainId: uint256
+  depositDeadline: uint32
+  fillDeadline: uint32
+  nonce: uint256
+```
+
+This ensures:
+- Quotes cannot be forged (cryptographic signature)
+- Quotes cannot be replayed (unique nonce)
+- Quotes are chain-specific (domain includes chain ID)
+- Quotes are contract-specific (domain includes verifying contract)
+
+## CREATE2 Deposit Addresses
+
+For Address Deposits, the deposit address is computed deterministically:
+
+```
+address = CREATE2(
+  deployer: FirmSwap,
+  salt: keccak256(abi.encode(quote, solverSignature)),
+  initCodeHash: keccak256(DepositProxy.creationCode ++ FirmSwap.address)
+)
+```
+
+This means:
+- The deposit address is known before any on-chain transaction
+- Only the specific quote can use that address
+- Anyone can call `settle()` to deploy the proxy and sweep funds
+- The proxy is minimal (~30 lines) — it just transfers tokens to FirmSwap. See the [Deposit Addresses](/docs/deposit-addresses/) deep dive for details.
+
+## Bond Mechanics
+
+### Per-Order Reservation
+
+When a user deposits tokens, 5% of the `outputAmount` is reserved from the solver's bond:
+
+```
+reserved = (outputAmount * BOND_RESERVATION_BPS) / 10_000
+```
+
+This limits the solver's concurrent order capacity:
+- 1,000 USDC bond → 20,000 USDC in simultaneous orders
+- 10,000 USDC bond → 200,000 USDC in simultaneous orders
+
+### Slash on Default
+
+If the solver fails to fill and the user calls `refund()`:
+1. The same 5% amount is deducted from the solver's `totalBond`
+2. The slashed USDC is transferred to the user
+3. If the solver's total bond is less than the slash amount, the entire remaining bond is taken
+
+### Unstake Flow
+
+```
+requestUnstake(amount) → wait 7 days → executeUnstake()
+```
+
+The 7-day delay ensures that:
+- Active orders have time to settle before bond is withdrawn
+- A compromised key cannot immediately drain the bond
+- The solver can cancel the request with `cancelUnstake()` if needed
+
+## ERC-7683 Compatibility
+
+FirmSwap implements the `IOriginSettler` interface from ERC-7683 (Cross-Chain Intents):
+
+```solidity
+function openFor(
+  GaslessCrossChainOrder calldata order,
+  bytes calldata signature,
+  bytes calldata originFillerData
+) external
+```
+
+This provides forward compatibility with cross-chain intent settlement standards. The `outputChainId` field exists in every quote but is currently enforced to match `block.chainid` (same-chain only).
+
+## Decentralization Model
+
+FirmSwap is designed to be fully permissionless at every layer:
+
+| Layer | Decentralized? | Details |
+|-------|---------------|---------|
+| **Smart Contract** | Yes | No owner, no admin, immutable parameters |
+| **Solver Registration** | Yes | Anyone with 1,000+ USDC bond can register |
+| **API** | Federated | Anyone can run an instance; users choose which to trust |
+| **SDK** | Yes | Open source; points at any API URL |
+| **Quote Signing** | Yes | EIP-712 — no intermediary needed |
+
+The API is the only semi-centralized component. However:
+- Multiple independent API instances can coexist
+- Each operator runs their own solver set
+- The smart contract is the source of truth
+- Users can interact directly with the contract (no API required)
+
+## Security Properties
+
+1. **No governance attacks**: Zero governance = zero governance attack surface
+2. **No oracle dependency**: Everything verified on the same chain, atomically
+3. **Deterministic outcomes**: Orders either fill at the exact quoted price or refund + compensate
+4. **Bounded solver risk**: Maximum loss per order is the 5% bond reservation
+5. **Replay protection**: EIP-712 nonces with bitmap-based batch cancellation
+6. **Reentrancy protection**: OpenZeppelin `ReentrancyGuard` on all state-mutating functions

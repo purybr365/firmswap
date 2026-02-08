@@ -1,0 +1,48 @@
+export const metadata = {
+  title: "Deployments",
+};
+
+# Deployments
+
+Contract addresses for FirmSwap across all supported networks.
+
+## Testnets
+
+### Gnosis Chiado (Chain ID 10200)
+
+| Contract | Address | Decimals |
+|----------|---------|----------|
+| FirmSwap | `0xE08Ee2901bbfD8A7837D294D3e43338871e075a4` | — |
+| tBRLA | `0x8bf8beBaBb2305F32C4fc5DBbE93b8accA5C45BC` | 18 |
+| tUSDC | `0xdC874bD78D67A27025e3b415A5ED698C88042FaC` | 6 |
+
+**RPC**: `https://rpc.chiadochain.net`
+
+**Block Explorer**: [Chiado Blockscout](https://blockscout.chiadochain.net/)
+
+**Faucet**: [Chiado Faucet](https://faucet.chiadochain.net/) — get testnet xDAI for gas fees.
+
+> The testnet tokens (tBRLA, tUSDC) are mock ERC-20 tokens deployed specifically for FirmSwap testing. They have no real value.
+
+## Mainnets
+
+Mainnet deployments are planned for the following chains. The FirmSwap contract uses the same bytecode across all chains — only the deployment address differs.
+
+| Chain | Chain ID | Status |
+|-------|----------|--------|
+| Gnosis | 100 | Planned |
+| Base | 8453 | Planned |
+| Polygon | 137 | Planned |
+| Arbitrum | 42161 | Planned |
+| Optimism | 10 | Planned |
+
+Mainnet launch will be announced on the [GitHub repository](https://github.com/purybr365/firmswap). Watch the repo for updates.
+
+## Contract Verification
+
+All FirmSwap contracts are verified on their respective block explorers. You can read and interact with the contract source code directly through the explorer interface.
+
+The FirmSwap contract is:
+- **Immutable** — no proxy pattern, no upgrade mechanism
+- **Ownerless** — no admin functions, no owner address
+- **Parameterized at compile time** — bond percentage (5%), minimum bond (1,000 USDC), and unstake delay (7 days) are constants

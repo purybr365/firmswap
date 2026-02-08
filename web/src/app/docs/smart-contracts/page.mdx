@@ -1,0 +1,167 @@
+export const metadata = {
+  title: "Smart Contracts",
+};
+
+# Smart Contracts
+
+FirmSwap's smart contract package is built with Foundry and uses OpenZeppelin Contracts v5.
+
+## Contract Architecture
+
+| Contract | Lines | Description |
+|----------|-------|-------------|
+| `FirmSwap.sol` | ~850 | Core protocol — implements IOriginSettler (ERC-7683) |
+| `DepositProxy.sol` | ~30 | Minimal CREATE2 sweep proxy for address deposits |
+| `QuoteLib.sol` | ~80 | EIP-712 quote hashing and validation |
+| `OrderLib.sol` | ~20 | Order ID computation |
+| `IFirmSwap.sol` | ~150 | Full interface with events, errors, structs |
+| `IERC7683.sol` | ~50 | Cross-chain intent settlement standard |
+
+## Constants
+
+| Name | Value | Description |
+|------|-------|-------------|
+| `MIN_BOND` | 1,000 USDC | Minimum bond to register as a solver |
+| `MIN_ORDER` | 1 USDC | Minimum order size |
+| `BOND_RESERVATION_BPS` | 500 (5%) | Bond reserved per active order |
+| `UNSTAKE_DELAY` | 7 days | Timelock between unstake request and execution |
+
+All constants are immutable — they cannot be changed after deployment.
+
+## Deposit Modes
+
+### Address Deposit (Mode A)
+
+1. Solver provides a quote
+2. `computeDepositAddress()` returns a deterministic CREATE2 address
+3. User transfers tokens to that address (via any method)
+4. Anyone calls `settle()` — the DepositProxy sweeps funds and completes the swap
+5. Zero user transactions with the contract
+
+For rounding tolerance, solvers can use `settleWithTolerance()` to accept a slightly lower deposit while still delivering the full quoted output amount.
+
+### Contract Deposit (Mode B)
+
+1. User calls `deposit()` or `depositWithPermit2()` with the solver-signed quote
+2. Solver calls `fill()` to deliver output tokens
+3. Two transactions total
+
+## Refund Paths
+
+If the solver fails to fill within the deadline:
+
+- **`refund()`** — For Contract Deposit orders past the fill deadline
+- **`refundAddressDeposit()`** — For Address Deposit orders past the fill deadline
+
+Both slash 5% of the solver's bond and send it to the user as compensation.
+
+### Recovery
+
+- **`recoverFromProxy()`** — Recovers any ERC-20 stuck in a deployed DepositProxy (after settle or refund)
+- **`deployAndRecover()`** — Deploys the proxy and recovers tokens when only a wrong token was sent (no settle/refund occurred)
+- **`withdrawExcess()`** — Withdraws excess tokens when a user deposited more than `quote.inputAmount`
+
+## Bond System
+
+### Registration
+
+```solidity
+function registerSolver(uint256 amount) external
+```
+
+Registers the caller as a solver and transfers `amount` of USDC as bond. Must be at least `MIN_BOND` (1,000 USDC).
+
+### Adding Bond
+
+```solidity
+function addBond(uint256 amount) external
+```
+
+Adds more bond to an existing registration. Increases order capacity.
+
+### Unstaking
+
+```solidity
+function requestUnstake(uint256 amount) external
+function executeUnstake() external
+function cancelUnstake() external
+```
+
+Three-step process with a 7-day delay:
+1. Call `requestUnstake(amount)` — sets the unstake amount and starts the timer
+2. Wait 7 days
+3. Call `executeUnstake()` — transfers bond back to the solver
+
+Constraints:
+- Only one pending unstake at a time
+- Remaining bond must stay above `MIN_BOND`
+- Cannot unstake reserved bond (bonds backing active orders)
+
+### Slashing
+
+When a user calls `refund()` or `refundAddressDeposit()`:
+- 5% of the output amount is deducted from the solver's bond
+- The slashed amount is transferred to the user
+- If the solver's total bond is less than the slash amount, the entire remaining bond is slashed
+
+## Nonce System
+
+Each quote has a unique nonce for replay protection:
+
+```solidity
+function cancelNonce(uint256 nonce) external
+function cancelNonces(uint248 wordPos, uint256 mask) external
+```
+
+- `cancelNonce()` — Cancel a single quote
+- `cancelNonces()` — Cancel up to 256 nonces in one transaction (bitmap-based)
+
+## Events
+
+| Event | When |
+|-------|------|
+| `Deposited(orderId, user, solver, inputToken, inputAmount, outputToken, outputAmount, fillDeadline)` | User deposits tokens |
+| `Settled(orderId, user, solver)` | Solver fills the order |
+| `Refunded(orderId, user, inputAmount, bondSlashed)` | Order refunded + bond slashed |
+| `ExcessDeposit(orderId, user, token, amount)` | Excess tokens stored for user |
+| `ExcessWithdrawn(user, token, amount)` | User withdraws excess tokens |
+| `TokensRecovered(orderId, token, recipient)` | Stuck tokens recovered |
+| `SolverRegistered(solver, amount)` | Solver registers with bond |
+| `BondAdded(solver, amount)` | Solver adds to bond |
+| `UnstakeRequested(solver, amount, executeAfter)` | Unstake requested |
+| `UnstakeExecuted(solver, amount)` | Unstake completed |
+| `UnstakeCancelled(solver)` | Unstake cancelled |
+
+## Deployment
+
+```bash
+# Build Permit2 first (separate solc version)
+cd contracts/lib/permit2 && forge build && cd ../..
+
+# Build FirmSwap
+forge build
+
+# Deploy
+forge script script/Deploy.s.sol:Deploy --broadcast --rpc-url $RPC_URL
+```
+
+## Testnet Addresses
+
+| Contract | Address (Chiado) |
+|----------|-----------------|
+| FirmSwap | `0xE08Ee2901bbfD8A7837D294D3e43338871e075a4` |
+| tBRLA | `0x8bf8beBaBb2305F32C4fc5DBbE93b8accA5C45BC` |
+| tUSDC | `0xdC874bD78D67A27025e3b415A5ED698C88042FaC` |
+
+## Test Suite
+
+87 tests total:
+- 64 unit tests (deposit, fill, refund, solver management, nonce cancellation, excess deposits, tolerance, recovery)
+- 12 integration tests (full Address Deposit + Contract Deposit flows, multi-solver, excess handling)
+- 8 fuzz tests (random amounts, deadlines, multiple orders)
+- 3 invariant tests (bond accounting, order state transitions, nonce uniqueness)
+
+```bash
+forge test                          # Default (1,000 fuzz runs)
+FOUNDRY_PROFILE=ci forge test       # CI profile (10,000 fuzz runs)
+```

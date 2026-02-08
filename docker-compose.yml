@@ -1,0 +1,59 @@
+services:
+  # ── Web (static site builder) ────────────────────────
+  # Runs once to build and copy static files to bind mount, then exits.
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    volumes:
+      - ./web-static:/web-static
+    restart: "no"
+
+  # ── API ──────────────────────────────────────────────
+  # Published on 127.0.0.1 only — nginx reverse-proxies external traffic.
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:3000:3000"
+    env_file:
+      - ./api/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3000"
+      DB_PATH: /data/firmswap-api.db
+      NODE_ENV: production
+      ALLOW_PRIVATE_SOLVER_IPS: "true"
+    volumes:
+      - api-data:/data
+    networks:
+      - firmswap
+    depends_on:
+      solver:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Solver (internal only) ──────────────────────────
+  # NO published ports — reachable only via Docker DNS (http://solver:3001).
+  solver:
+    build:
+      context: ./solver
+      dockerfile: Dockerfile
+    env_file:
+      - ./solver/.env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3001"
+      API_URL: http://api:3000
+      SOLVER_PUBLIC_URL: http://solver:3001
+    networks:
+      - firmswap
+    restart: unless-stopped
+
+volumes:
+  api-data:
+
+networks:
+  firmswap:
+    driver: bridge

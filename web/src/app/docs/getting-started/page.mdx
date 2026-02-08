@@ -1,0 +1,131 @@
+export const metadata = {
+  title: "Getting Started",
+};
+
+# Getting Started
+
+This guide walks through the FirmSwap flow from requesting a quote to completing a swap.
+
+## Prerequisites
+
+- Node.js 20+
+- A wallet with testnet tokens (get them from the [Chiado Faucet](https://faucet.chiadochain.net/))
+
+## Install the SDK
+
+```bash
+npm install @firmswap/sdk viem
+```
+
+## Request a Quote
+
+```typescript
+import { FirmSwapClient } from "@firmswap/sdk";
+
+const client = new FirmSwapClient({
+  apiUrl: "http://localhost:3000",
+  chainId: 10200, // Gnosis Chiado
+  rpcUrl: "https://rpc.chiadochain.net",
+  firmSwapAddress: "0xE08Ee2901bbfD8A7837D294D3e43338871e075a4",
+});
+
+const quoteResponse = await client.getQuote({
+  inputToken: "0x8bf8beBaBb2305F32C4fc5DBbE93b8accA5C45BC",  // tBRLA
+  outputToken: "0xdC874bD78D67A27025e3b415A5ED698C88042FaC", // tUSDC
+  orderType: "EXACT_INPUT",
+  amount: "1000000000000000000", // 1 tBRLA
+  userAddress: "0xYourAddress...",
+  originChainId: 10200,
+  destinationChainId: 10200,
+  depositMode: "CONTRACT",
+});
+```
+
+The response includes:
+- `quote` — The firm quote with exact input/output amounts and deadlines
+- `solverSignature` — The solver's EIP-712 signature committing to the quote
+- `depositAddress` — For Address Deposit mode, the CREATE2 address to send tokens to
+
+> **Deadlines**: The quote includes `depositDeadline` (deposit by this time) and `fillDeadline` (solver fills by this time). Both are Unix timestamps set by the API. You can customize the deposit window by adding `depositWindow: 120` (seconds) to the quote request.
+
+## Deposit Tokens
+
+### Option A: Contract Deposit
+
+```typescript
+// The SDK handles approve + deposit in one call
+const txHash = await client.deposit(walletClient, quoteResponse);
+await publicClient.waitForTransactionReceipt({ hash: txHash });
+```
+
+### Option B: Address Deposit (Zero User Transactions)
+
+```typescript
+const quoteResponse = await client.getQuote({
+  // ... same params but with:
+  depositMode: "ADDRESS",
+});
+
+// Get the deterministic deposit address
+const depositAddr = await client.getDepositAddress(quoteResponse);
+
+// Transfer tokens to this address using any method
+// (wallet transfer, CEX withdrawal, etc.)
+```
+
+### Option C: Permit2 Deposit
+
+```typescript
+import { depositWithPermit2, ensurePermit2Approval } from "@firmswap/sdk";
+
+// One-time: approve Permit2 for the token
+await ensurePermit2Approval(walletClient, publicClient, tokenAddress);
+
+// Deposit using Permit2 (no separate approve tx needed)
+const txHash = await depositWithPermit2({
+  walletClient,
+  publicClient,
+  firmSwapAddress: "0xE08Ee2901bbfD8A7837D294D3e43338871e075a4",
+  quote: deserializeQuote(quoteResponse.quote),
+  solverSignature: quoteResponse.solverSignature,
+});
+```
+
+## Check Order Status
+
+```typescript
+const status = await client.getOrderStatus("0xOrderId...");
+// Returns: { state: "SETTLED", ... }
+```
+
+Or via the API (no RPC needed):
+
+```typescript
+const status = await client.getOrderStatusViaApi("0xOrderId...");
+```
+
+## What Happens on Default?
+
+If the solver fails to fill the order within the deadline:
+1. The user calls `refund()` (or `refundAddressDeposit()` for Address Deposits)
+2. The user receives their input tokens back
+3. 5% of the solver's bond (denominated in the output amount) is slashed and sent to the user as compensation
+
+## Running the Full Stack Locally
+
+```bash
+# Clone the monorepo
+git clone https://github.com/purybr365/firmswap.git
+cd firmswap
+
+# 1. Run the API
+cd api && npm install && npm run dev
+
+# 2. Run the solver (in a separate terminal)
+cd solver && cp .env.example .env
+# Edit .env: set SOLVER_PRIVATE_KEY
+npm install && npm run dev
+
+# 3. Use the SDK to interact
+cd sdk && npm install
+```
