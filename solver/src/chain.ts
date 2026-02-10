@@ -5,9 +5,8 @@ import {
   type PublicClient,
   type WalletClient,
   type Address,
-  type Account,
 } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { privateKeyToAccount, type PrivateKeyAccount } from "viem/accounts";
 import { gnosis, gnosisChiado, base, polygon, arbitrum, optimism } from "viem/chains";
 import { config } from "./config.js";
 import firmSwapAbi from "./abi/FirmSwap.json" with { type: "json" };
@@ -30,7 +29,7 @@ export const publicClient: PublicClient = createPublicClient({
 
 export function createSolverWalletClient(
   privateKey: `0x${string}`,
-): { walletClient: WalletClient; account: Account } {
+): { walletClient: WalletClient; account: PrivateKeyAccount } {
   const account = privateKeyToAccount(privateKey);
   const walletClient = createWalletClient({
     account,
